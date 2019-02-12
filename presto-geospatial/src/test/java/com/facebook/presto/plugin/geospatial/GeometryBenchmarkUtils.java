@@ -34,4 +34,20 @@ public class GeometryBenchmarkUtils
         String[] parts = line.split("\\|");
         return parts[0];
     }
+
+    public static String createPolygon(double longitude, double nbVertices)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.append("POLYGON((");
+        String separator = "";
+        for (int i = 0; i < nbVertices; i++) {
+            sb.append(separator);
+            sb.append(longitude);
+            sb.append(" ");
+            sb.append(Math.cos(2.0 * Math.PI * i / nbVertices));
+            separator = ",";
+        }
+        sb.append("))");
+        return sb.toString();
+    }
 }

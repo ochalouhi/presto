@@ -102,6 +102,7 @@ import static io.airlift.slice.Slices.utf8Slice;
 import static io.airlift.slice.Slices.wrappedBuffer;
 import static java.lang.Double.isInfinite;
 import static java.lang.Double.isNaN;
+import static java.lang.Math.PI;
 import static java.lang.Math.atan2;
 import static java.lang.Math.cos;
 import static java.lang.Math.sin;
@@ -119,6 +120,7 @@ public final class GeoFunctions
     private static final Slice EMPTY_POLYGON = serialize(new OGCPolygon(new Polygon(), null));
     private static final Slice EMPTY_MULTIPOINT = serialize(createFromEsriGeometry(new MultiPoint(), null, true));
     private static final double EARTH_RADIUS_KM = 6371.01;
+    private static final double EARTH_RADIUS_M = EARTH_RADIUS_KM * 1000.0;
     private static final Map<Reason, String> NON_SIMPLE_REASONS = ImmutableMap.<Reason, String>builder()
             .put(DegenerateSegments, "Degenerate segments")
             .put(Clustering, "Repeated points")
@@ -1504,6 +1506,172 @@ public final class GeoFunctions
         GeometryType type = GeometryType.getForEsriGeometryType(geometry.geometryType());
         if (!validTypes.contains(type)) {
             throw new PrestoException(INVALID_FUNCTION_ARGUMENT, format("When applied to SphericalGeography inputs, %s only supports %s. Input type is: %s", function, OR_JOINER.join(validTypes), type));
+        }
+    }
+
+    @SqlNullable
+    @Description("Returns the area of a geometry on the Earth's surface")
+    @ScalarFunction("ST_Area")
+    @SqlType(DOUBLE)
+    public static Double stSphericalArea(@SqlType(SPHERICAL_GEOGRAPHY_TYPE_NAME) Slice input)
+    {
+        return stSphericalArea(input, false);
+    }
+
+    static Double stSphericalArea(@SqlType(SPHERICAL_GEOGRAPHY_TYPE_NAME) Slice input, @SqlType(BOOLEAN) boolean ignorePoles)
+    {
+        OGCGeometry geometry = deserialize(input);
+        if (geometry.isEmpty()) {
+            return null;
+        }
+
+        validateSphericalType("ST_Area", geometry, EnumSet.of(POLYGON, MULTI_POLYGON));
+
+        return sphericalPolygonArea((Polygon) geometry.getEsriGeometry(), ignorePoles);
+    }
+
+    private static double sphericalPolygonArea(Polygon polygon, boolean ignorePoles)
+    {
+        // See https://www.movable-type.co.uk/scripts/latlong.html
+        // and http://osgeo-org.1560.x6.nabble.com/Area-of-a-spherical-polygon-td3841625.html
+        // and https://www.element84.com/blog/determining-if-a-spherical-polygon-contains-a-pole
+        // for the underlying Maths
+
+        double sphericalExcess = 0.0;
+
+        int numPaths = polygon.getPathCount();
+        for (int i = 0; i < numPaths; i++) {
+            double sign = polygon.isExteriorRing(i) ? 1.0 : -1.0;
+            sphericalExcess += sign * sphericalPathExcess(polygon, i, ignorePoles);
+        }
+
+        return Math.abs(sphericalExcess * EARTH_RADIUS_M * EARTH_RADIUS_M);
+    }
+
+    private static double sphericalPathExcess(Polygon polygon, int pathIndex, boolean ignorePoles)
+    {
+        int start = polygon.getPathStart(pathIndex);
+        int end = polygon.getPathEnd(pathIndex);
+        if (end - start < 3) {
+            // A path with less than 3 points is not valid for calculating an area
+            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, format("Can't calculate the area of a polygon with rings with less than 3 vertices. Input has %d", end - start));
+        }
+
+        // If our path is already closed, let's consider it to be shorter by 1 point
+        if (polygon.getPoint(start).equals(polygon.getPoint(end - 1))) {
+            end = end - 1;
+        }
+
+        // .getPoint allocates a new Point object on every call, unless we give it a point to store the result
+        Point tempOutPoint = new Point();
+
+        // In our path, the end point precedes the first one
+        polygon.getPoint(end - 1, tempOutPoint);
+        BearingAndExcessCalculator calculator = new BearingAndExcessCalculator(tempOutPoint, ignorePoles);
+
+        for (int i = start; i < end; i++) {
+            polygon.getPoint(i, tempOutPoint);
+            calculator.processPoint(tempOutPoint);
+        }
+
+        return calculator.getSphericalExcess();
+    }
+
+    private static class BearingAndExcessCalculator
+    {
+        private static final double TWO_PI = 2 * Math.PI;
+        private static final double THREE_PI = 3 * Math.PI;
+
+        private final boolean ignorePoles;
+        private double sphericalExcess;
+        private double courseDelta;
+
+        private boolean hasProcessedPoint;
+        private double firstInitialBearing;
+        private double previousBearing;
+
+        private double phiPreviousPoint;
+        private double cosPreviousPoint;
+        private double sinPreviousPoint;
+        private double tanPreviousPoint;
+        private double longitudePreviousPoint;
+
+        public BearingAndExcessCalculator(Point endPoint, boolean ignorePoles)
+        {
+            phiPreviousPoint = toRadians(endPoint.getY());
+            sinPreviousPoint = Math.sin(phiPreviousPoint);
+            cosPreviousPoint = Math.cos(phiPreviousPoint);
+            tanPreviousPoint = Math.tan(phiPreviousPoint / 2);
+            longitudePreviousPoint = toRadians(endPoint.getX());
+            this.ignorePoles = ignorePoles;
+        }
+
+        private void processPoint(Point p)
+        {
+            double phiCurrentPoint = toRadians(p.getY());
+            double tanCurrentPoint = Math.tan(phiCurrentPoint / 2);
+            double longitudeCurrentPoint = toRadians(p.getX());
+
+            // Only process points which are different from the previous one,
+            // Otherwise calculating the bearing is not deterministic
+            if (longitudeCurrentPoint != longitudePreviousPoint || phiCurrentPoint != phiPreviousPoint) {
+                double deltaLambda = longitudeCurrentPoint - longitudePreviousPoint;
+                sphericalExcess += 2 * Math.atan2(Math.tan(deltaLambda / 2) * (tanPreviousPoint + tanCurrentPoint), 1 + tanPreviousPoint * tanCurrentPoint);
+
+                if (!ignorePoles) {
+                    double cosCurrentPoint = Math.cos(phiCurrentPoint);
+                    double sinCurrentPoint = Math.sin(phiCurrentPoint);
+                    double sinDeltaLambda = Math.sin(deltaLambda);
+                    double cosDeltaLambda = Math.cos(deltaLambda);
+
+                    // Initial bearing from previous to current
+                    double y = sinDeltaLambda * cosCurrentPoint;
+                    double x = cosPreviousPoint * sinCurrentPoint - sinPreviousPoint * cosCurrentPoint * cosDeltaLambda;
+                    double initialBearing = (Math.atan2(y, x) + TWO_PI) % TWO_PI;
+
+                    // Final bearing from previous to current = opposite of bearing from current to previous
+                    double finalY = -sinDeltaLambda * cosPreviousPoint;
+                    double finalX = sinPreviousPoint * cosCurrentPoint - cosPreviousPoint * sinCurrentPoint * cosDeltaLambda;
+                    double finalBearing = (Math.atan2(finalY, finalX) + PI) % TWO_PI;
+
+                    if (hasProcessedPoint) {
+                        courseDelta += (initialBearing - previousBearing + THREE_PI) % TWO_PI - PI;
+                    }
+                    else {
+                        //Delay the computation above until we have the last bearing
+                        firstInitialBearing = initialBearing;
+                    }
+
+                    courseDelta += (finalBearing - initialBearing + THREE_PI) % TWO_PI - PI;
+
+                    previousBearing = finalBearing;
+
+                    cosPreviousPoint = cosCurrentPoint;
+                    sinPreviousPoint = sinCurrentPoint;
+                }
+
+                phiPreviousPoint = phiCurrentPoint;
+                tanPreviousPoint = tanCurrentPoint;
+                longitudePreviousPoint = longitudeCurrentPoint;
+            }
+
+            hasProcessedPoint = true;
+        }
+
+        public double getSphericalExcess()
+        {
+            if (!ignorePoles) {
+                // Now that we have our last point bearing, we can calculate the remaining course delta
+                courseDelta += (firstInitialBearing - previousBearing + THREE_PI) % TWO_PI - PI;
+
+                // The courseDelta should be 2Pi or - 2Pi, unless a pole is enclosed (and then it should be ~ 0)
+                // In which case we need to correct the spherical excess by 2Pi
+                if (Math.abs(courseDelta) < PI / 4) {
+                    sphericalExcess = Math.abs(sphericalExcess) - TWO_PI;
+                }
+            }
+
+            return sphericalExcess;
         }
     }
 

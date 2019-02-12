@@ -21,7 +21,13 @@ import com.google.common.collect.ImmutableList;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 import static com.facebook.presto.metadata.FunctionExtractor.extractFunctions;
 import static com.facebook.presto.plugin.geospatial.SphericalGeographyType.SPHERICAL_GEOGRAPHY;
@@ -143,5 +149,64 @@ public class TestSphericalGeoFunctions
     private void assertDistance(String wkt, String otherWkt, Double expectedDistance)
     {
         assertFunction(format("ST_Distance(to_spherical_geography(ST_GeometryFromText('%s')), to_spherical_geography(ST_GeometryFromText('%s')))", wkt, otherWkt), DOUBLE, expectedDistance);
+    }
+
+    @Test
+    public void testArea()
+            throws IOException
+    {
+        //PA
+        assertPolygonAreaWithinPrecision("-79.76278 42.252649, -79.76278 42.000709, -75.35932 42.000709, -75.249781 41.863786, -75.173104 41.869263, -75.052611 41.754247, -75.074519 41.60637, -74.89378 41.436584, -74.740426 41.431108, -74.69661 41.359907, -74.828057 41.288707, -74.882826 41.179168, -75.134765 40.971045, -75.052611 40.866983, -75.205966 40.691721, -75.195012 40.576705, -75.069042 40.543843, -75.058088 40.417874, -74.773287 40.215227, -74.82258 40.127596, -75.129289 39.963288, -75.145719 39.88661, -75.414089 39.804456, -75.616736 39.831841, -75.786521 39.722302, -79.477979 39.722302, -80.518598 39.722302, -80.518598 40.636951, -80.518598 41.978802, -80.518598 41.978802, -80.332382 42.033571, -79.76278 42.269079, -79.76278 42.252649", 117255.1312637E6, 2E2);
+
+        //A polygon around the North Pole
+        assertPolygonAreaWithinPrecision("-135 85, -45 85, 45 85, 135 85, -135 85", 619002051089.943, 1E3);
+
+        assertPolygonAreaWithinPrecision("0 0, 0 1, 1 1, 1 0", 12364E6, 1E3);
+
+        assertPolygonAreaWithinPrecision("-122.150124 37.486095, -122.149201 37.486606,  -122.145725 37.486580, -122.145923 37.483961 , -122.149324 37.482480 ,  -122.150837 37.483238,  -122.150901 37.485392", 163290.93943446054, 1E5);
+        double angleOfOneKm = 0.008993201943349;
+        assertPolygonAreaWithinPrecision(format("0 0, %.15f 0, %.15f %.15f, 0 %.15f", angleOfOneKm, angleOfOneKm, angleOfOneKm, angleOfOneKm), 1E6, 1E5);
+
+        //1/4th of an hemisphere, ie 1/8th of the planet, should be close to 4PiR2/8 = 637.5E11
+        assertPolygonAreaWithinPrecision("90 0, 0 0, 0 90", 637.5E11, 1E3);
+
+        Path geometryPath = Paths.get(BenchmarkGeometryAggregations.class.getClassLoader().getResource("us-states.tsv").getPath());
+        Map<String, String> stateGeometries = Files.lines(geometryPath)
+                .map(line -> line.split("\t"))
+                .collect(Collectors.toMap(parts -> parts[0], parts -> parts[1]));
+
+        Path areaPath = Paths.get(BenchmarkGeometryAggregations.class.getClassLoader().getResource("us-states-area.tsv").getPath());
+        Map<String, Double> stateAreas = Files.lines(areaPath)
+                .map(line -> line.split("\t"))
+                .filter(parts -> parts.length >= 2)
+                .collect(Collectors.toMap(parts -> parts[0], parts -> Double.valueOf(parts[1]) * 1E6));
+
+        for (String state : stateGeometries.keySet()) {
+            Double stateArea = stateAreas.get(state);
+            String stateGeometry = stateGeometries.get(state);
+            if (stateArea != null && stateGeometry != null) {
+                assertWKTAreaWithinPrecision(stateGeometry, stateArea, 200); // 0.5% max difference
+            }
+        }
+    }
+
+    private void assertPolygonArea(String polygonWkt, double expectedArea)
+    {
+        assertWKTArea(format("POLYGON((%s))", polygonWkt), expectedArea);
+    }
+
+    private void assertPolygonAreaWithinPrecision(String polygonWkt, double expectedArea, double precision)
+    {
+        assertWKTAreaWithinPrecision(format("POLYGON((%s))", polygonWkt), expectedArea, precision);
+    }
+
+    private void assertWKTArea(String wkt, double expectedArea)
+    {
+        assertFunction(format("ST_Area(to_spherical_geography(ST_GeometryFromText('%s')))", wkt), DOUBLE, expectedArea);
+    }
+
+    private void assertWKTAreaWithinPrecision(String wkt, double expectedArea, double precision)
+    {
+        assertFunction(format("ABS(ROUND((ST_Area(to_spherical_geography(ST_GeometryFromText('%s'))) / %s - 1 ) * %s, 0))", wkt, expectedArea, precision), DOUBLE, 0.0);
     }
 }

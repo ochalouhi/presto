@@ -203,6 +203,12 @@ Accessors
     For GeometryCollection types, returns the sum of the areas of the individual
     geometries.
 
+.. function:: ST_Area(SphericalGeography) -> double
+
+    Returns the spherical Area of a geography, using Earth's model
+
+    Works for Polygon and MultiPolygon types.
+
 .. function:: ST_Centroid(Geometry) -> Geometry
 
     Returns the point value that is the mathematical centroid of a geometry.
